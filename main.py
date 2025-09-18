@@ -8,6 +8,28 @@ centerline_points = np.array([centerline(s) for s in s_points])
 
 sim = Simulator()
 
+def analyze_lap(sim):
+    ts, xs, us, crash, slip = sim.get_results()
+    positions = xs[0:2].T
+    distances = np.linalg.norm(positions - np.array([0, 0]), axis=1)
+    
+    # First, find where we first leave the start (go beyond 2m)
+    left_start = np.where(distances > 2.0)[0][0]
+    
+    # Then find when we come back near start
+    near_start = distances[left_start:] < 1.0
+    lap_complete = np.where(near_start)[0]
+    
+    if len(lap_complete) > 0:
+        lap_end = left_start + lap_complete[0]
+        lap_time = ts[lap_end] - ts[0]
+        print(f"Lap Time: {lap_time:.2f}s")
+        print(f"Max Speed: {np.max(xs[3]):.2f} m/s")
+        print(f"Crashes: {np.sum(crash)}")
+        print(f"Slips: {np.sum(slip)}")
+    else:
+        print("No complete lap detected")
+
 # Pure Pursuit parameters
 L = 1.58     # wheelbase [m] (from README)
 L_d = 3.0    # lookahead distance [m] (start conservative)
@@ -79,5 +101,6 @@ def controller(x):
 
 sim.set_controller(controller)
 sim.run()
+analyze_lap(sim)
 sim.animate()  
 sim.plot()
