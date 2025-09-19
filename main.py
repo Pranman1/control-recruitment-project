@@ -1,106 +1,126 @@
 import numpy as np
 from simulator import Simulator, centerline
 
-# Pre-compute centerline points for efficiency
+# Track precomputation
 track_length = 100.0
-s_points = np.linspace(0, track_length, 100)  # Reduced number of points
+s_points = np.linspace(0, track_length, 300)
 centerline_points = np.array([centerline(s) for s in s_points])
+
+# Params
+dt = 0.1
+L = 1.58
+N = 8          # prediction horizon
+v_ref = 6.0    # target speed
+
+# Cost weights
+w_pos = 20000.0      # centerline tracking
+w_speed = 100.0     # speed tracking
+w_u = 0.1         # control effort
+w_out = 500.0     # penalty for leaving track
 
 sim = Simulator()
 
-def analyze_lap(sim):
-    ts, xs, us, crash, slip = sim.get_results()
-    positions = xs[0:2].T
-    distances = np.linalg.norm(positions - np.array([0, 0]), axis=1)
-    
-    # First, find where we first leave the start (go beyond 2m)
-    left_start = np.where(distances > 2.0)[0][0]
-    
-    # Then find when we come back near start
-    near_start = distances[left_start:] < 1.0
-    lap_complete = np.where(near_start)[0]
-    
-    if len(lap_complete) > 0:
-        lap_end = left_start + lap_complete[0]
-        lap_time = ts[lap_end] - ts[0]
-        print(f"Lap Time: {lap_time:.2f}s")
-        print(f"Max Speed: {np.max(xs[3]):.2f} m/s")
-        print(f"Crashes: {np.sum(crash)}")
-        print(f"Slips: {np.sum(slip)}")
-    else:
-        print("No complete lap detected")
+class MPCWithBoundary:
+    def __init__(self, sim):
+        self.sim = sim
 
-# Pure Pursuit parameters
-L = 1.58     # wheelbase [m] (from README)
-L_d = 3.0    # lookahead distance [m] (start conservative)
-v_ref = 5.0  # target speed [m/s] (start slower)
+    def _linearized_AB(self, state):
+        """Linearize KBM dynamics at current state"""
+        x, y, theta, v, phi = state
+        A = np.eye(5)
+        A[0, 2] = -dt * v * np.sin(theta)
+        A[0, 3] = dt * np.cos(theta)
+        A[1, 2] = dt * v * np.cos(theta)
+        A[1, 3] = dt * np.sin(theta)
+        A[2, 3] = dt * np.tan(phi) / L
+        A[2, 4] = dt * v / (L * np.cos(phi)**2)
+        A[3, 3] = 1.0
+        A[4, 4] = 1.0
+
+        B = np.zeros((5, 2))
+        B[3, 0] = dt   # accel -> velocity
+        B[4, 1] = dt   # steering rate -> phi
+        return A, B
+
+    def _get_reference(self, pos, s_current):
+        """Reference = centerline points with target speed"""
+        ref = []
+        for k in range(N+1):
+            s_look = (s_current + k * 1.5) % track_length
+            idx = np.argmin(np.abs(s_points - s_look))
+            ref.append([centerline_points[idx, 0], centerline_points[idx, 1], v_ref])
+        return np.array(ref)
+
+    def _rollout_cost(self, state, U, ref):
+        """Compute rollout cost with soft penalties"""
+        cost = 0.0
+        x = state.copy()
+
+        for k in range(N):
+            # Apply controls
+            a, phi_dot = U[k]
+            x[0] += dt * x[3] * np.cos(x[2])
+            x[1] += dt * x[3] * np.sin(x[2])
+            x[2] += dt * (x[3] / L) * np.tan(x[4])
+            x[3] += dt * a
+            x[4] += dt * phi_dot
+
+            # Track following cost
+            track_err = (x[0] - ref[k, 0])**2 + (x[1] - ref[k, 1])**2
+            cost += w_pos * track_err
+
+            # Speed cost
+            cost += w_speed * (x[3] - v_ref)**2
+
+            # Control effort
+            cost += w_u * (a**2 + phi_dot**2)
+
+            # Collision penalty
+            if self.sim._check_collision(x):
+                cost += w_out
+
+        return cost
+
+    def solve(self, state):
+        """Brute force search over discretized controls (fast enough for small N)"""
+        accel_options = np.linspace(-2.0, 3.0, 3)      # coarse accel set
+        steer_rate_options = np.linspace(-0.5, 0.5, 3) # coarse steering vel set
+
+        pos = state[:2]
+        dists = np.linalg.norm(centerline_points - pos, axis=1)
+        closest_idx = np.argmin(dists)
+        s_current = s_points[closest_idx]
+
+        ref = self._get_reference(pos, s_current)
+
+        best_cost = 1e9
+        best_u0 = np.array([0.0, 0.0])
+
+        # Try all combinations of first-step controls
+        for a in accel_options:
+            for sd in steer_rate_options:
+                U = np.tile([a, sd], (N, 1))  # repeat same action for horizon
+                cost = self._rollout_cost(state.copy(), U, ref)
+                if cost < best_cost:
+                    best_cost = cost
+                    best_u0 = np.array([a, sd])
+
+        return best_u0
+
+mpc = MPCWithBoundary(sim)
 
 def controller(x):
-    """Pure Pursuit controller with adaptive lookahead"""
-    # 1. Current state
-    pos_x = x[0]
-    pos_y = x[1]
-    heading = x[2]    # 0 = pointing left
-    velocity = x[3]
-    steering = x[4]
-    
-    # 2. Find closest point using pre-computed centerline
-    pos = np.array([pos_x, pos_y])
-    dists = np.linalg.norm(centerline_points - pos, axis=1)
-    closest_idx = np.argmin(dists)
-    s_current = s_points[closest_idx]
-    
-    # 3. Calculate adaptive lookahead distance
-    L_d_adaptive = max(2.0, 0.5 + 0.3 * velocity)  # More conservative
-    
-    # 4. Find lookahead point
-    # Calculate desired s-coordinate
-    s_look = (s_current + L_d_adaptive) % track_length
-    
-    # Find closest pre-computed point
-    look_idx = np.argmin(np.abs(s_points - s_look))
-    target_x, target_y = centerline_points[look_idx]
-    
-    # 5. Transform to vehicle coordinates
-    # Shift and rotate target point into car's reference frame
-    dx = target_x - pos_x
-    dy = target_y - pos_y
-    
-    # Rotate by -heading to get into car's frame
-    dx_body = np.cos(-heading) * dx - np.sin(-heading) * dy
-    dy_body = np.sin(-heading) * dx + np.cos(-heading) * dy
-    
-    # 6. Pure Pursuit steering control
-    # Calculate curvature command
-    kappa = 2.0 * dy_body / (dx_body * dx_body + dy_body * dy_body)
-    
-    # Convert curvature to steering angle
-    theta_des = np.arctan2(L * kappa, 1.0)
-    
-    # Calculate steering rate command (P controller)
-    k_steering = 2.0  # Steering gain
-    theta_dot = k_steering * (theta_des - steering)
-    
-    # Clip steering rate to valid range
-    theta_dot = np.clip(theta_dot, -1.0, 1.0)
-    
-    # 7. Speed control
-    # Start with conservative speed control
-    target_speed = min(v_ref, 3.0 + velocity)  # Gradual speed increase
-    
-    # Reduce speed in curves
-    curve_factor = 1.0 / (1.0 + 5.0 * abs(kappa))
-    target_speed *= curve_factor
-    
-    # Simple P controller for speed
-    speed_error = target_speed - velocity
-    accel = 1.0 * speed_error
-    accel = np.clip(accel, -4.0, 10.0)
-    
-    return np.array([accel, theta_dot])
+    return mpc.solve(x)
 
+def analyze_lap(sim):
+    ts, xs, us, crash, slip = sim.get_results()
+    print(f"Crashes: {np.sum(crash)}")
+    print(f"Slips: {np.sum(slip)}")
+    print(f"Max speed: {np.max(xs[3]):.2f} m/s")
+
+# Run
 sim.set_controller(controller)
 sim.run()
 analyze_lap(sim)
-sim.animate()  
+sim.animate()
 sim.plot()
