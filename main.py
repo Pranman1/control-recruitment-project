@@ -20,9 +20,9 @@ ACCEL_MIN, ACCEL_MAX = -4.0, 10.0          # Acceleration bounds
 MAX_COMBINED_ACCEL = 12.0                  # Friction limit
 
 # COST FUNCTION WEIGHTS (For optimization objective)
-Q_pos = 1000.0      # Position tracking weight
+Q_pos = 10.0      # Position tracking weight
 Q_heading = 500.0   # Heading tracking weight  
-Q_speed = 100.0     # Speed tracking weight
+Q_speed = 1000.0     # Speed tracking weight
 R_control = 1.0     # Control effort weight
 
 sim = Simulator()
