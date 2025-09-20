@@ -1,204 +1,218 @@
 import numpy as np
+from scipy.optimize import minimize
 from simulator import Simulator, centerline
 
 # Track precomputation
 track_length = 100.0
-s_points = np.linspace(0, track_length, 500)  # Higher resolution
+s_points = np.linspace(0, track_length, 500)
 centerline_points = np.array([centerline(s) for s in s_points])
 
-# MPC Parameters
-dt = 0.1
-L = 1.58
-N = 4          # Even shorter horizon for speed
-v_ref = 8.0    # Much higher target speed
+# MPC PARAMETERS
+dt = 0.1      # Discretization time step
+L = 1.58      # Vehicle wheelbase
+N = 5         # Prediction horizon length
+v_ref = 7.0   # Target velocity
 
-# Constraints (from problem statement)
-THETA_MIN, THETA_MAX = -0.7, 0.7
-THETA_DOT_MIN, THETA_DOT_MAX = -1.0, 1.0
-ACCEL_MIN, ACCEL_MAX = -4.0, 10.0
+# HARD CONSTRAINTS (These can NEVER be violated)
+THETA_MIN, THETA_MAX = -0.7, 0.7           # Steering angle bounds
+THETA_DOT_MIN, THETA_DOT_MAX = -1.0, 1.0   # Steering rate bounds  
+ACCEL_MIN, ACCEL_MAX = -4.0, 10.0          # Acceleration bounds
+MAX_COMBINED_ACCEL = 12.0                  # Friction limit
 
-# Cost weights - more aggressive tuning
-w_pos = 5000.0      # Lower centerline penalty (allow more deviation)
-w_speed = 200.0     # Higher speed penalty (push for speed)
-w_heading = 500.0   # Lower heading penalty (allow more aggressive turns)
-w_u = 0.1           # Very low control effort (allow aggressive inputs)
-w_boundary = 50000.0  # Still high for safety
+# COST FUNCTION WEIGHTS (For optimization objective)
+Q_pos = 1000.0      # Position tracking weight
+Q_heading = 500.0   # Heading tracking weight  
+Q_speed = 100.0     # Speed tracking weight
+R_control = 1.0     # Control effort weight
 
 sim = Simulator()
 
-class RobustMPC:
+class ProperMPC:
     def __init__(self, sim):
         self.sim = sim
-        # Use actual cone positions from simulator
-        self.left_cones = sim.left_cones
-        self.right_cones = sim.right_cones
-        self.all_cones = sim.cones
         
-    def _get_track_info(self, pos):
-        """Get closest point on centerline and track direction"""
-        dists = np.linalg.norm(centerline_points - pos, axis=1)
+    def _get_reference_trajectory(self, current_pos, current_heading):
+        """
+        REFERENCE GENERATION: Creates desired trajectory for vehicle to follow
+        Returns: Array of reference states [x, y, heading, velocity] for horizon N
+        """
+        # Find closest point on track centerline
+        dists = np.linalg.norm(centerline_points - current_pos, axis=1)
         closest_idx = np.argmin(dists)
+        s_current = s_points[closest_idx]
         
-        # Get track direction (tangent)
-        next_idx = (closest_idx + 1) % len(centerline_points)
-        prev_idx = (closest_idx - 1) % len(centerline_points)
-        
-        track_dir = centerline_points[next_idx] - centerline_points[prev_idx]
-        track_dir = track_dir / np.linalg.norm(track_dir)
-        track_heading = np.arctan2(track_dir[1], track_dir[0])
-        
-        return s_points[closest_idx], centerline_points[closest_idx], track_heading
-    
-    def _get_cone_distances(self, pos):
-        """Get distances to nearest left and right cones"""
-        left_dists = np.linalg.norm(self.left_cones - pos, axis=1)
-        right_dists = np.linalg.norm(self.right_cones - pos, axis=1)
-        
-        min_left_dist = np.min(left_dists)
-        min_right_dist = np.min(right_dists)
-        
-        return min_left_dist, min_right_dist
-    
-    def _get_reference_trajectory(self, s_current, current_heading):
-        """Generate reference trajectory ahead - more aggressive lookahead"""
-        ref_states = []
-        
-        for k in range(N + 1):
-            # More aggressive lookahead - look further ahead
-            s_look = (s_current + k * v_ref * dt * 1.5) % track_length
-            idx = np.argmin(np.abs(s_points - s_look))
+        ref_trajectory = []
+        for k in range(N):
+            # Look ahead along track based on target speed
+            s_ahead = (s_current + k * v_ref * dt) % track_length
+            idx = np.argmin(np.abs(s_points - s_ahead))
             
+            # Get reference position
             ref_pos = centerline_points[idx]
             
-            # Calculate reference heading (track direction)
+            # Calculate reference heading (track tangent direction)
             next_idx = (idx + 1) % len(centerline_points)
-            track_dir = centerline_points[next_idx] - centerline_points[idx]
-            if np.linalg.norm(track_dir) > 0:
-                ref_heading = np.arctan2(track_dir[1], track_dir[0])
-            else:
-                ref_heading = current_heading
-                
-            ref_states.append([ref_pos[0], ref_pos[1], ref_heading, v_ref])
+            track_tangent = centerline_points[next_idx] - centerline_points[idx]
+            ref_heading = np.arctan2(track_tangent[1], track_tangent[0])
             
-        return np.array(ref_states)
+            ref_trajectory.append([ref_pos[0], ref_pos[1], ref_heading, v_ref])
+            
+        return np.array(ref_trajectory)
     
-    def _simulate_step(self, state, control):
-        """Single step KBM simulation with constraint enforcement"""
+    def _kinematic_bicycle_model(self, state, control):
+        """
+        SYSTEM DYNAMICS: x_{k+1} = f(x_k, u_k)
+        Kinematic bicycle model - predicts next state from current state and control
+        """
         x, y, theta, v, phi = state
         a, phi_dot = control
         
-        # Enforce control constraints
-        a = np.clip(a, ACCEL_MIN, ACCEL_MAX)
-        phi_dot = np.clip(phi_dot, THETA_DOT_MIN, THETA_DOT_MAX)
+        # KBM equations:
+        x_next = x + dt * v * np.cos(theta)           # x position
+        y_next = y + dt * v * np.sin(theta)           # y position  
+        theta_next = theta + dt * (v/L) * np.tan(phi) # heading angle
+        v_next = v + dt * a                           # velocity
+        phi_next = phi + dt * phi_dot                 # steering angle
         
-        # Kinematic bicycle model
-        x_new = x + dt * v * np.cos(theta)
-        y_new = y + dt * v * np.sin(theta)
-        theta_new = theta + dt * (v / L) * np.tan(phi)
-        v_new = v + dt * a
-        phi_new = phi + dt * phi_dot
-        
-        # Enforce state constraints
-        phi_new = np.clip(phi_new, THETA_MIN, THETA_MAX)
-        v_new = max(0.5, v_new)  # Allow higher minimum speed
-        
-        return np.array([x_new, y_new, theta_new, v_new, phi_new])
+        return np.array([x_next, y_next, theta_next, v_next, phi_next])
     
-    def _evaluate_trajectory(self, state, controls, ref_trajectory):
-        """Evaluate cost of control sequence using actual cone positions"""
-        cost = 0.0
-        current_state = state.copy()
+    def _mpc_cost_function(self, u_flat, current_state, ref_trajectory):
+        """
+        MPC OBJECTIVE FUNCTION: J = Σ(||x_k - x_ref||²_Q + ||u_k||²_R)
+        This is what we minimize - tracking error + control effort
+        """
+        # Reshape flat control vector into N x 2 matrix
+        u_sequence = u_flat.reshape(N, 2)
+        
+        total_cost = 0.0
+        state = current_state.copy()
         
         for k in range(N):
-            # Simulate one step
-            current_state = self._simulate_step(current_state, controls[k])
+            # PREDICTION: Forward simulate using system dynamics
+            state = self._kinematic_bicycle_model(state, u_sequence[k])
             
-            # Position error (centerline tracking)
-            pos_error = np.linalg.norm(current_state[:2] - ref_trajectory[k, :2])
-            cost += w_pos * pos_error**2
+            # COST TERMS:
+            # 1. Position tracking: ||[x,y] - [x_ref,y_ref]||²
+            pos_error = np.linalg.norm(state[:2] - ref_trajectory[k, :2])
+            total_cost += Q_pos * pos_error**2
             
-            # Heading error
-            heading_error = current_state[2] - ref_trajectory[k, 2]
-            # Normalize angle difference
+            # 2. Heading tracking: (theta - theta_ref)²
+            heading_error = state[2] - ref_trajectory[k, 2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-            cost += w_heading * heading_error**2
+            total_cost += Q_heading * heading_error**2
             
-            # Speed tracking
-            speed_error = current_state[3] - ref_trajectory[k, 3]
-            cost += w_speed * speed_error**2
+            # 3. Speed tracking: (v - v_ref)²
+            speed_error = state[3] - ref_trajectory[k, 3]
+            total_cost += Q_speed * speed_error**2
             
-            # Control effort
-            cost += w_u * (controls[k, 0]**2 + controls[k, 1]**2)
+            # 4. Control effort: ||u||² = a² + φ_dot²
+            total_cost += R_control * np.sum(u_sequence[k]**2)
             
-            # ACTUAL collision detection with cones
-            if self.sim._check_collision(current_state):
-                cost += w_boundary  # Huge penalty for collision
-                
-            # Cone avoidance using actual cone positions - less conservative
-            left_dist, right_dist = self._get_cone_distances(current_state[:2])
-            min_safe_distance = 0.6  # Smaller minimum safe distance for more aggressive driving
-            
-            if left_dist < min_safe_distance:
-                cost += w_boundary * (min_safe_distance - left_dist)**2
-            if right_dist < min_safe_distance:
-                cost += w_boundary * (min_safe_distance - right_dist)**2
-        
-        return cost
+        return total_cost
     
-    def solve(self, state):
-        """Solve MPC optimization with grid search"""
-        # Get track reference
-        s_current, closest_center, track_heading = self._get_track_info(state[:2])
-        ref_trajectory = self._get_reference_trajectory(s_current, state[2])
+    def _constraint_functions(self, u_flat, current_state):
+        """
+        MPC CONSTRAINTS: g(x,u) ≤ 0
+        These define the feasible region - solutions must satisfy ALL constraints
+        """
+        u_sequence = u_flat.reshape(N, 2)
+        constraints = []
+        state = current_state.copy()
         
-        # Grid search parameters - more aggressive ranges
-        accel_options = np.linspace(-4.0, 8.0, 4)  # Use full acceleration range
-        steer_options = np.linspace(-1.0, 1.0, 4)  # Use full steering rate range
-        
-        best_cost = float('inf')
-        best_controls = np.zeros((N, 2))
-        
-        # Search over first control input
-        for a in accel_options:
-            for phi_dot in steer_options:
-                # Simple strategy: apply same control for entire horizon
-                controls = np.tile([a, phi_dot], (N, 1))
+        for k in range(N):
+            # Forward simulate
+            state = self._kinematic_bicycle_model(state, u_sequence[k])
+            
+            # CONSTRAINT 1: No collision with cones (most critical)
+            if self.sim._check_collision(state):
+                constraints.append(1.0)  # Violated if > 0
+            else:
+                constraints.append(-1.0)  # Satisfied if ≤ 0
                 
-                # Evaluate this control sequence
-                cost = self._evaluate_trajectory(state, controls, ref_trajectory)
+            # CONSTRAINT 2: Combined acceleration limit (friction)
+            combined_accel = np.sqrt(u_sequence[k, 0]**2 + 
+                           ((state[3]**2/0.79) * np.sin(np.arctan(0.5*np.tan(state[4]))))**2)
+            constraints.append(combined_accel - MAX_COMBINED_ACCEL)
+            
+            # CONSTRAINT 3: Steering angle limits  
+            constraints.append(state[4] - THETA_MAX)    # phi ≤ phi_max
+            constraints.append(THETA_MIN - state[4])    # phi ≥ phi_min
+            
+        return np.array(constraints)
+    
+    def solve(self, current_state):
+        """
+        MPC OPTIMIZATION: Solve the constrained optimization problem
+        
+        Standard MPC formulation:
+        min  J(x,u) = Σ(||x_k-x_ref||²_Q + ||u_k||²_R)
+        s.t. x_{k+1} = f(x_k, u_k)           [dynamics]
+             g(x_k, u_k) ≤ 0                [inequality constraints]
+             u_min ≤ u_k ≤ u_max            [bound constraints]
+        """
+        # Generate reference trajectory
+        ref_traj = self._get_reference_trajectory(current_state[:2], current_state[2])
+        
+        # DECISION VARIABLES: Control sequence u = [u_0, u_1, ..., u_{N-1}]
+        # Each u_k = [acceleration, steering_rate]
+        u_init = np.zeros(N * 2)  # Initial guess: do nothing
+        
+        # BOUND CONSTRAINTS: u_min ≤ u ≤ u_max
+        bounds = []
+        for k in range(N):
+            bounds.append((ACCEL_MIN, ACCEL_MAX))        # Acceleration bounds
+            bounds.append((THETA_DOT_MIN, THETA_DOT_MAX)) # Steering rate bounds
+            
+        # INEQUALITY CONSTRAINTS: g(x,u) ≤ 0
+        constraints = {
+            'type': 'ineq',
+            'fun': lambda u: -self._constraint_functions(u, current_state)  # Flip sign for ≤ 0
+        }
+        
+        # SOLVE OPTIMIZATION PROBLEM
+        try:
+            result = minimize(
+                fun=lambda u: self._mpc_cost_function(u, current_state, ref_traj),
+                x0=u_init,
+                bounds=bounds,
+                constraints=constraints,
+                method='SLSQP',  # Sequential Least Squares Programming
+                options={'maxiter': 100, 'ftol': 1e-4}
+            )
+            
+            if result.success:
+                optimal_u = result.x.reshape(N, 2)
+                return optimal_u[0]  # RECEDING HORIZON: Apply only first control
+            else:
+                # Fallback: emergency brake and minimal steering
+                return np.array([-2.0, 0.0])
                 
-                if cost < best_cost:
-                    best_cost = cost
-                    best_controls = controls.copy()
-        
-        # Return first control input (MPC receding horizon)
-        optimal_control = best_controls[0]
-        
-        # Final safety clipping
-        optimal_control[0] = np.clip(optimal_control[0], ACCEL_MIN, ACCEL_MAX)
-        optimal_control[1] = np.clip(optimal_control[1], THETA_DOT_MIN, THETA_DOT_MAX)
-        
-        return optimal_control
+        except:
+            # Fallback for any optimization failure
+            return np.array([-2.0, 0.0])
 
 # Initialize MPC controller
-mpc = RobustMPC(sim)
+mpc = ProperMPC(sim)
 
 def controller(x):
-    """Main controller function"""
+    """
+    MAIN CONTROLLER: Called at each time step with current state
+    Returns: Control input [acceleration, steering_rate]
+    """
     return mpc.solve(x)
 
-# Analysis function
 def analyze_lap(sim):
+    """Analyze simulation results"""
     ts, xs, us, crash, slip = sim.get_results()
-    print(f"Simulation Results:")
-    print(f"  Crashes: {np.sum(crash)}")
+    print(f"Results:")
+    print(f"  Crashes: {np.sum(crash)} (should be 0)")
     print(f"  Slips: {np.sum(slip)}")
-    print(f"  Max speed: {np.max(xs[3]):.2f} m/s")
-    print(f"  Avg speed: {np.mean(xs[3]):.2f} m/s")
+    print(f"  Max speed: {np.max(xs[3]):.1f} m/s")
+    print(f"  Avg speed: {np.mean(xs[3]):.1f} m/s")
     
-    # Check constraint violations
-    steering_violations = np.sum((xs[4] < THETA_MIN) | (xs[4] > THETA_MAX))
-    print(f"  Steering violations: {steering_violations}")
+    # Check hard constraint violations
+    steering_viols = np.sum((xs[4] < THETA_MIN) | (xs[4] > THETA_MAX))
+    print(f"  Steering violations: {steering_viols} (should be 0)")
 
 # Run simulation
 sim.set_controller(controller)
